@@ -121,7 +121,7 @@ func (r *Reporter) send() error {
 	r.reg.Each(func(name string, i interface{}) {
 		tags := r.tags
 		if idx := strings.IndexRune(name, ','); idx != -1 {
-			tags := map[string]string{}
+			tags = map[string]string{}
 			for k, v := range r.tags {
 				tags[k] = v
 			}
