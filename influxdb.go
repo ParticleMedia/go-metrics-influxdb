@@ -4,13 +4,15 @@ import (
 	"fmt"
 	"log"
 	uurl "net/url"
+	"strings"
+	"sync"
 	"time"
 
 	client "github.com/influxdata/influxdb1-client"
 	"github.com/rcrowley/go-metrics"
 )
 
-type reporter struct {
+type Reporter struct {
 	reg      metrics.Registry
 	interval time.Duration
 	align    bool
@@ -23,22 +25,25 @@ type reporter struct {
 	tags        map[string]string
 
 	client *client.Client
+
+	done chan struct{}
+	wg   *sync.WaitGroup
 }
 
 // InfluxDB starts a InfluxDB reporter which will post the metrics from the given registry at each d interval.
-func InfluxDB(r metrics.Registry, d time.Duration, url, database, measurement, username, password string, align bool) {
-	InfluxDBWithTags(r, d, url, database, measurement, username, password, map[string]string{}, align)
+func InfluxDB(r metrics.Registry, d time.Duration, url, database, measurement, username, password string, align bool) *Reporter {
+	return InfluxDBWithTags(r, d, url, database, measurement, username, password, map[string]string{}, align)
 }
 
 // InfluxDBWithTags starts a InfluxDB reporter which will post the metrics from the given registry at each d interval with the specified tags
-func InfluxDBWithTags(r metrics.Registry, d time.Duration, url, database, measurement, username, password string, tags map[string]string, align bool) {
+func InfluxDBWithTags(r metrics.Registry, d time.Duration, url, database, measurement, username, password string, tags map[string]string, align bool) *Reporter {
 	u, err := uurl.Parse(url)
 	if err != nil {
 		log.Printf("unable to parse InfluxDB url %s. err=%v", url, err)
-		return
+		return nil
 	}
 
-	rep := &reporter{
+	rep := &Reporter{
 		reg:         r,
 		interval:    d,
 		url:         *u,
@@ -48,16 +53,19 @@ func InfluxDBWithTags(r metrics.Registry, d time.Duration, url, database, measur
 		password:    password,
 		tags:        tags,
 		align:       align,
+		done:        make(chan struct{}),
+		wg:          &sync.WaitGroup{},
 	}
 	if err := rep.makeClient(); err != nil {
 		log.Printf("unable to make InfluxDB client. err=%v", err)
-		return
+		return nil
 	}
 
-	rep.run()
+	go rep.run()
+	return rep
 }
 
-func (r *reporter) makeClient() (err error) {
+func (r *Reporter) makeClient() (err error) {
 	r.client, err = client.NewClient(client.Config{
 		URL:      r.url,
 		Username: r.username,
@@ -67,7 +75,15 @@ func (r *reporter) makeClient() (err error) {
 	return
 }
 
-func (r *reporter) run() {
+func (r *Reporter) Close() {
+	close(r.done)
+	r.wg.Wait()
+}
+
+func (r *Reporter) run() {
+	r.wg.Add(1)
+	defer r.wg.Done()
+
 	intervalTicker := time.Tick(r.interval)
 	pingTicker := time.Tick(time.Second * 5)
 
@@ -86,11 +102,16 @@ func (r *reporter) run() {
 					log.Printf("unable to make InfluxDB client. err=%v", err)
 				}
 			}
+		case <-r.done:
+			if err := r.send(); err != nil {
+				log.Printf("unable to send metrics to InfluxDB. err=%v", err)
+			}
+			return
 		}
 	}
 }
 
-func (r *reporter) send() error {
+func (r *Reporter) send() error {
 	var pts []client.Point
 
 	now := time.Now()
@@ -98,13 +119,26 @@ func (r *reporter) send() error {
 		now = now.Truncate(r.interval)
 	}
 	r.reg.Each(func(name string, i interface{}) {
+		tags := r.tags
+		if idx := strings.IndexRune(name, ','); idx != -1 {
+			tags := map[string]string{}
+			for k, v := range r.tags {
+				tags[k] = v
+			}
+			for _, kv := range strings.Split(name[idx+1:], ",") {
+				if tagIdx := strings.IndexRune(kv, '='); tagIdx != -1 {
+					tags[kv[:tagIdx]] = kv[tagIdx+1:]
+				}
+			}
+			name = name[:idx]
+		}
 
 		switch metric := i.(type) {
 		case metrics.Counter:
 			ms := metric.Snapshot()
 			pts = append(pts, client.Point{
 				Measurement: r.measurement,
-				Tags:        r.tags,
+				Tags:        tags,
 				Fields: map[string]interface{}{
 					fmt.Sprintf("%s.count", name): ms.Count(),
 				},
@@ -114,7 +148,7 @@ func (r *reporter) send() error {
 			ms := metric.Snapshot()
 			pts = append(pts, client.Point{
 				Measurement: r.measurement,
-				Tags:        r.tags,
+				Tags:        tags,
 				Fields: map[string]interface{}{
 					fmt.Sprintf("%s.gauge", name): ms.Value(),
 				},
@@ -124,7 +158,7 @@ func (r *reporter) send() error {
 			ms := metric.Snapshot()
 			pts = append(pts, client.Point{
 				Measurement: r.measurement,
-				Tags:        r.tags,
+				Tags:        tags,
 				Fields: map[string]interface{}{
 					fmt.Sprintf("%s.gauge", name): ms.Value(),
 				},
@@ -150,7 +184,7 @@ func (r *reporter) send() error {
 			for k, v := range fields {
 				pts = append(pts, client.Point{
 					Measurement: r.measurement,
-					Tags:        bucketTags(k, r.tags),
+					Tags:        bucketTags(k, tags),
 					Fields: map[string]interface{}{
 						fmt.Sprintf("%s.histogram", name): v,
 					},
@@ -170,7 +204,7 @@ func (r *reporter) send() error {
 			for k, v := range fields {
 				pts = append(pts, client.Point{
 					Measurement: r.measurement,
-					Tags:        bucketTags(k, r.tags),
+					Tags:        bucketTags(k, tags),
 					Fields: map[string]interface{}{
 						fmt.Sprintf("%s.meter", name): v,
 					},
@@ -202,7 +236,7 @@ func (r *reporter) send() error {
 			for k, v := range fields {
 				pts = append(pts, client.Point{
 					Measurement: r.measurement,
-					Tags:        bucketTags(k, r.tags),
+					Tags:        bucketTags(k, tags),
 					Fields: map[string]interface{}{
 						fmt.Sprintf("%s.timer", name): v,
 					},
